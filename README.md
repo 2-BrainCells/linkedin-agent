@@ -60,11 +60,15 @@ agent compose --channel email
 agent send --channel linkedin            # dry-run
 agent send --channel linkedin --live     # actually send
 
-agent send --channel email               # dry-run
+agent send --channel email               # dry-run (initial + any due followups)
 agent send --channel email --live        # actually send
 
+# After sending an initial email, two followups are scheduled automatically.
+# Run this on a cron/Task Scheduler timer to fire due followups:
+agent followup --live                    # send only followups whose due_at has passed
+
 # Inspect state anytime
-agent status
+agent status                             # includes followup counts + replies skipped
 agent inspect <prospect_id|profile_url>
 ```
 
@@ -77,8 +81,9 @@ All behavior knobs live in `config.yaml`:
 - `ollama`: model names for filter / personalize / parse
 - `templates`: paths to message + email body + subject + signature
 - `filter.criteria`: free-form description of who you want to keep
+- `followups`: email followup cadence (default 24h then 72h), templates, IMAP reply-detection settings
 
-Secrets go in `.env` (gitignored). Only `GMAIL_APP_PASSWORD` is required.
+Secrets go in `.env` (gitignored). Only `GMAIL_APP_PASSWORD` is required (used for both SMTP send and IMAP reply detection).
 
 ## Verification checklist
 

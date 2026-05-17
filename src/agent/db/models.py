@@ -43,12 +43,14 @@ class OutreachChannel(str, enum.Enum):
 
 
 class OutreachStatus(str, enum.Enum):
-    DRAFTED = "drafted"
+    DRAFTED = "drafted"            # ready to send now (sequence=1 typically)
+    SCHEDULED = "scheduled"        # followup waiting for due_at to pass
     SENT = "sent"
     FAILED = "failed"
     SKIPPED_CAP = "skipped_cap"
     SKIPPED_DRY_RUN = "skipped_dry_run"
     SKIPPED_DUPLICATE = "skipped_duplicate"
+    SKIPPED_REPLIED = "skipped_replied"  # recipient replied — followup canceled
 
 
 class Prospect(Base):
@@ -103,7 +105,8 @@ class OutreachEvent(Base):
     __tablename__ = "outreach_events"
     __table_args__ = (
         UniqueConstraint(
-            "prospect_id", "channel", "recipient_email", name="uq_outreach_dedup"
+            "prospect_id", "channel", "recipient_email", "sequence_number",
+            name="uq_outreach_dedup",
         ),
     )
 
@@ -120,6 +123,18 @@ class OutreachEvent(Base):
     status: Mapped[OutreachStatus] = mapped_column(
         Enum(OutreachStatus), default=OutreachStatus.DRAFTED, index=True
     )
+    # Sequence: 1 = initial, 2 = first followup, 3 = second followup, ...
+    sequence_number: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    # Earliest time this event may be sent; NULL = immediate.
+    due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    # Links followups back to the initial event in the same chain.
+    parent_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("outreach_events.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Email Message-ID set when this event was sent; used to thread followups.
+    message_id: Mapped[str] = mapped_column(String(255), default="")
     error_text: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

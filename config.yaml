@@ -47,6 +47,24 @@ templates:
   email_subject: ./templates/email_subject.txt
   email_body: ./templates/email_outreach.md
 
+followups:
+  # Enable/disable the entire followup feature.
+  enabled: true
+  # Cadence: each step fires `delay_hours` after the PREVIOUS email was sent.
+  # The first step fires `delay_hours` after the initial email.
+  email_sequence:
+    - delay_hours: 24
+      template: ./templates/email_followup_1.md
+    - delay_hours: 72
+      template: ./templates/email_followup_2.md
+  reply_detection:
+    enabled: true
+    imap_host: imap.gmail.com
+    imap_port: 993
+    mailbox: INBOX
+    # If IMAP check fails: "skip" (don't send, retry next run) or "send" (send anyway).
+    on_error: skip
+
 filter:
   # Free-form criteria the LLM uses to score each prospect's headline.
   # Edit per campaign or override with `agent filter --criteria-file path.md`.

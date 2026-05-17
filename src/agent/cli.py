@@ -10,10 +10,14 @@ from rich.table import Table
 from sqlalchemy import func, select
 
 from agent.config import PROJECT_ROOT, load_settings
+from datetime import datetime, timezone
+
+from agent.db.migrate import migrate
 from agent.db.models import (
     ContactInfo,
     OutreachChannel,
     OutreachEvent,
+    OutreachStatus,
     Prospect,
     ProspectStatus,
 )
@@ -42,7 +46,7 @@ def _bootstrap() -> None:
 
 @app.command()
 def init() -> None:
-    """Scaffold .env from .env.example if missing, ensure data dirs exist."""
+    """Scaffold .env from .env.example if missing, run migrations, check models."""
     _bootstrap()
     env = PROJECT_ROOT / ".env"
     example = PROJECT_ROOT / ".env.example"
@@ -50,6 +54,9 @@ def init() -> None:
         env.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
         rprint(f"[green]created[/green] {env}")
     settings = load_settings()
+    added = migrate()
+    if added:
+        rprint(f"[green]migrated[/green] new columns: {added}")
     rprint(f"[green]database[/green]: {settings.resolve_path(settings.paths.database)}")
     rprint(f"[green]chrome profile[/green]: "
            f"{settings.resolve_path(settings.linkedin.browser_profile_dir)}")
@@ -60,6 +67,14 @@ def init() -> None:
         ok = is_model_available(model)
         marker = "[green]ok[/green]" if ok else "[red]MISSING[/red]"
         rprint(f"ollama model {model}: {marker}")
+    if settings.followups.enabled:
+        steps = settings.followups.email_sequence
+        rprint(f"[green]followups[/green]: {len(steps)} step(s) "
+               f"({', '.join(f'+{s.delay_hours}h' for s in steps) or 'none configured'})")
+        rd = settings.followups.reply_detection
+        rprint(f"[green]reply detection[/green]: "
+               f"{'enabled' if rd.enabled else 'disabled'} "
+               f"({rd.imap_host}:{rd.imap_port}, on_error={rd.on_error})")
 
 
 @app.command()
@@ -140,7 +155,11 @@ def send(
                               help="Actually send. Default is dry-run."),
     limit: Optional[int] = typer.Option(None, "--limit"),
 ) -> None:
-    """Send drafted outreach events. DRY-RUN by default."""
+    """Send drafted outreach events (initial emails + any due followups).
+
+    DRY-RUN by default. For email channel, this also processes any followup
+    events whose scheduled due time has passed.
+    """
     _bootstrap()
     dry_run = not live
     if channel == "linkedin":
@@ -156,6 +175,25 @@ def send(
 
 
 @app.command()
+def followup(
+    live: bool = typer.Option(False, "--live",
+                              help="Actually send. Default is dry-run."),
+    limit: Optional[int] = typer.Option(None, "--limit"),
+) -> None:
+    """Send ONLY due followup emails (skip new initial drafts).
+
+    Useful for cron-style invocation that runs every few hours to fire any
+    followups whose scheduled time has passed.
+    """
+    _bootstrap()
+    try:
+        out = send_email_drafts(dry_run=not live, limit=limit, only_followups=True)
+    except MissingAppPassword as e:
+        raise typer.BadParameter(str(e))
+    rprint(out)
+
+
+@app.command()
 def status() -> None:
     """Show pipeline counts and today's cap usage."""
     _bootstrap()
@@ -163,6 +201,7 @@ def status() -> None:
     usage = today_usage(settings)
     rem = usage.remaining(settings)
 
+    now = datetime.now(timezone.utc)
     with session_scope() as s:
         counts = {}
         for st in ProspectStatus:
@@ -173,6 +212,32 @@ def status() -> None:
         emails_with_contact = s.scalar(
             select(func.count(ContactInfo.id)).where(ContactInfo.emails != [])
         ) or 0
+        scheduled_total = s.scalar(
+            select(func.count(OutreachEvent.id)).where(
+                OutreachEvent.status == OutreachStatus.SCHEDULED
+            )
+        ) or 0
+        scheduled_due_now = s.scalar(
+            select(func.count(OutreachEvent.id)).where(
+                OutreachEvent.status == OutreachStatus.SCHEDULED,
+                OutreachEvent.due_at.isnot(None),
+                OutreachEvent.due_at <= now,
+            )
+        ) or 0
+        replied_count = s.scalar(
+            select(func.count(OutreachEvent.id)).where(
+                OutreachEvent.status == OutreachStatus.SKIPPED_REPLIED
+            )
+        ) or 0
+        sent_by_seq = {}
+        for seq in (1, 2, 3):
+            sent_by_seq[seq] = s.scalar(
+                select(func.count(OutreachEvent.id)).where(
+                    OutreachEvent.channel == OutreachChannel.EMAIL,
+                    OutreachEvent.status == OutreachStatus.SENT,
+                    OutreachEvent.sequence_number == seq,
+                )
+            ) or 0
 
     t = Table(title="Prospects by status")
     t.add_column("Status"); t.add_column("Count", justify="right")
@@ -186,6 +251,17 @@ def status() -> None:
     t2.add_row("linkedin messages", str(usage.linkedin_sent), str(rem["linkedin_messages"]))
     t2.add_row("emails", str(usage.emails_sent), str(rem["emails"]))
     rprint(t2)
+
+    t3 = Table(title="Email followups")
+    t3.add_column("Bucket"); t3.add_column("Count", justify="right")
+    t3.add_row("scheduled (total)", str(scheduled_total))
+    t3.add_row("scheduled (due now)", str(scheduled_due_now))
+    t3.add_row("skipped — replied", str(replied_count))
+    t3.add_row("sent: initial (seq 1)", str(sent_by_seq[1]))
+    t3.add_row("sent: followup 1 (seq 2)", str(sent_by_seq[2]))
+    t3.add_row("sent: followup 2 (seq 3)", str(sent_by_seq[3]))
+    rprint(t3)
+
     rprint(f"prospects with at least one email: [bold]{emails_with_contact}[/bold]")
 
 
@@ -212,12 +288,15 @@ def inspect(target: str = typer.Argument(..., help="Prospect ID or profile URL."
         })
         events = list(s.scalars(
             select(OutreachEvent).where(OutreachEvent.prospect_id == p.id)
-            .order_by(OutreachEvent.id.desc()).limit(5)
+            .order_by(OutreachEvent.channel, OutreachEvent.sequence_number,
+                      OutreachEvent.id.desc()).limit(10)
         ))
         for e in events:
             rprint({
                 "channel": e.channel.value, "status": e.status.value,
-                "recipient": e.recipient_email, "sent_at": str(e.sent_at),
+                "seq": e.sequence_number, "recipient": e.recipient_email,
+                "due_at": str(e.due_at) if e.due_at else None,
+                "sent_at": str(e.sent_at) if e.sent_at else None,
                 "subject": e.rendered_subject,
                 "preview": e.rendered_body[:200],
             })

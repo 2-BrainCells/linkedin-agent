@@ -262,9 +262,99 @@ agent send --channel email --live   # actually sends via Gmail
 
 **What it does:** For each prospect with a drafted email event, sends the email from your Gmail account via SMTP (the same protocol Gmail uses for standard email sending). Uses STARTTLS encryption — your password is never sent in plaintext.
 
-**Deduplication:** If you accidentally run `send --channel email --live` twice, it does not send duplicate emails. The database tracks which `(prospect, email address)` pairs have been sent.
+This command sends both **initial** emails (newly drafted) **and** any **followup** emails whose scheduled time has arrived. See the next section for the followup system.
+
+**Deduplication:** If you accidentally run `send --channel email --live` twice, it does not send duplicate emails. The database tracks which `(prospect, email address, sequence)` triples have been sent.
 
 **Gmail App Password explained:** Gmail requires a special 16-character "App Password" (instead of your main Google password) for this type of SMTP access. This is a security feature — if the App Password is ever compromised, you can revoke just it without affecting your Google account. It's generated at `myaccount.google.com/apppasswords`.
+
+---
+
+### Followups (the 3-email sequence)
+
+Every initial email automatically gets two followups scheduled — by default, **24 hours** after the initial, then **72 hours** after the first followup. So each prospect gets up to 3 emails:
+
+| Email | When | Template | Subject |
+|---|---|---|---|
+| Initial | Immediately on `send --channel email --live` | `templates/email_outreach.md` | from `email_subject.txt` |
+| Followup 1 | +24h after initial | `templates/email_followup_1.md` | `Re: <original subject>` |
+| Followup 2 | +72h after followup 1 (96h after initial) | `templates/email_followup_2.md` | `Re: <original subject>` |
+
+**Same Gmail thread.** Followups carry `In-Reply-To` and `References` headers pointing to the initial email's Message-ID. Gmail (and most other email clients) groups them into a single conversation thread for the recipient.
+
+**How the schedule actually works:**
+
+1. You run `agent send --channel email --live`.
+2. The initial email is sent. Its database event gets `sequence_number=1`, `status=sent`, and a `sent_at` timestamp.
+3. Immediately after, the system creates two more events for the same prospect:
+   - `sequence_number=2`, `status=scheduled`, `due_at = sent_at + 24h`, body pre-rendered from `email_followup_1.md`
+   - `sequence_number=3`, `status=scheduled`, `due_at = (sent_at + 24h) + 72h = sent_at + 96h`, body from `email_followup_2.md`
+4. Later, when you run `agent send --channel email --live` (or `agent followup --live`), the system looks for `status=scheduled` events whose `due_at` is in the past, and sends them.
+
+**Important:** The agent is not a daemon — it doesn't wake itself up at +24h to send. **You need to run the command** (or schedule it via Task Scheduler / cron). Recommended cadence: run `agent followup --live` every 1–4 hours during the day. See "Automating followups" below.
+
+**The `agent followup` command:**
+
+```powershell
+agent followup            # dry-run preview of which followups are due
+agent followup --live     # actually send any due followups (no new initials)
+```
+
+This is identical to `agent send --channel email --live` except it skips brand-new initial drafts — handy for cron-style automation when you only want to fire schedules.
+
+**Reply detection (auto-stop on reply):**
+
+Before sending each followup, the agent connects to your Gmail inbox via IMAP and asks: *"Has this person sent me any email since I sent the initial?"* If yes, the followup is **canceled** (marked `skipped_replied`), and any later followups in the same sequence are also canceled.
+
+This means: someone replies "thanks, not interested" → they don't get two more pestering followups.
+
+**Reply detection requirements:**
+- IMAP must be enabled in Gmail (it's on by default for personal accounts).
+- The same `GMAIL_APP_PASSWORD` you use for sending is reused for IMAP.
+- The agent only checks your INBOX. If a reply is auto-archived by a filter to another label, it might be missed.
+
+**If IMAP is unreachable** (network issue, etc.): controlled by `followups.reply_detection.on_error` in `config.yaml`:
+- `skip` (default, safe): don't send the followup this run; try again next run.
+- `send`: send anyway, accepting that you might message someone who replied.
+
+**Configuring delays:** Change them in `config.yaml`:
+
+```yaml
+followups:
+  email_sequence:
+    - delay_hours: 24    # change to 48 or whatever
+      template: ./templates/email_followup_1.md
+    - delay_hours: 72
+      template: ./templates/email_followup_2.md
+```
+
+You can add a third (or fourth, or fifth) followup by appending more entries — and adding a corresponding template file.
+
+**Disabling followups entirely:**
+
+```yaml
+followups:
+  enabled: false
+```
+
+With this off, `agent send --channel email --live` sends only the initial email and never schedules followups.
+
+**Editing followups for one prospect:** Open `data/agent.db` with [DB Browser for SQLite](https://sqlitebrowser.org/). Find the relevant `outreach_events` rows (filter by `prospect_id` and `channel='email'`). You can:
+- Change a `due_at` to push a followup later
+- Set `status='skipped_replied'` to cancel a followup
+- Edit `rendered_body` to customize one specific followup
+
+**Automating followups (Windows Task Scheduler):**
+
+1. Open Task Scheduler → Create Basic Task
+2. Name: "LinkedIn Agent Followups"
+3. Trigger: Daily, recur every 1 day, repeat every 2 hours for 24 hours
+4. Action: Start a program
+5. Program: `D:\LinkedIn Agent\.venv\Scripts\agent.exe`
+6. Arguments: `followup --live`
+7. Start in: `D:\LinkedIn Agent`
+
+The agent will check for due followups every 2 hours and send anything ready. Combine with the working-hours gate in `config.yaml` to keep sends inside business hours.
 
 ---
 
@@ -347,7 +437,7 @@ Everything is stored in `data/agent.db`, a single SQLite file you can open with 
 |---|---|
 | `prospects` | One row per person. Name, headline, status, filter score, about text |
 | `contact_info` | Emails, phone, Twitter, website — one row per prospect |
-| `outreach_events` | Each drafted/sent message. One row per (prospect, channel, email address) |
+| `outreach_events` | Each drafted/sent/scheduled message. One row per (prospect, channel, email, sequence). Includes `due_at`, `parent_event_id`, `message_id` for the followup system. |
 | `profile_visits` | Every profile page the agent visited, with timestamp |
 | `audit_events` | Every significant action the agent took, with whether it was a dry-run |
 
@@ -462,8 +552,19 @@ The agent skips prospects already at `enriched` status or beyond. To re-run enri
    ├─ agent send linkedin → [Chrome types & sends DM]  ← --live required
    │                        [outreach_events: SENT]
    │
-   └─ agent send email ──→ [Gmail SMTP sends email]    ← --live required
-                           [outreach_events: SENT]
+   └─ agent send email ──→ [Gmail SMTP sends initial]  ← --live required
+                           [outreach_events: SENT seq=1]
+                                  │
+                                  └→ [schedules followup 1 (+24h) and 2 (+96h)]
+                                     [outreach_events: SCHEDULED seq=2,3]
+                                              │
+                          [later runs of `agent followup --live`]
+                                              │
+                          [IMAP reply check — skip if recipient replied]
+                                              │
+                          [Gmail SMTP sends followup] [with In-Reply-To header]
+                                              │
+                          [outreach_events: SENT, or SKIPPED_REPLIED]
 
   At every step:
     audit.log records the action (always)

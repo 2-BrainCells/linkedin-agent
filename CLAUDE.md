@@ -68,7 +68,35 @@ Every action that touches LinkedIn or sends email is gated by three checks. If y
 
 ## Conventions worth knowing before editing
 
-- **Idempotent drafts:** `compose_linkedin_drafts` skips prospects with an existing LinkedIn `OutreachEvent`. `compose_email_drafts` creates **one event per recipient email** and dedups by `UniqueConstraint(prospect_id, channel, recipient_email)` — recipient_email is empty string for LinkedIn rows. Honor this when adding new outreach types.
+- **Idempotent drafts:** `compose_linkedin_drafts` skips prospects with an existing LinkedIn `OutreachEvent`. `compose_email_drafts` creates **one event per (recipient email, sequence_number=1)** and dedups by `UniqueConstraint(prospect_id, channel, recipient_email, sequence_number)`. recipient_email is empty string for LinkedIn rows. Honor this when adding new outreach types.
 - **Two senders share a code path shape:** `send_linkedin_drafts` (async, browser) and `send_email_drafts` (sync, SMTP) deliberately mirror each other — load drafted events, branch on dry-run, gate with caps, update status + sent_at, audit. New channels should follow the same shape.
 - **Don't widen what runs in a session_scope:** LLM calls inside `compose_*_drafts` hold the SQLite transaction open across multi-second Ollama requests. Acceptable for v1 because SQLite is single-writer and we run interactively. If you parallelize, generate openers first and persist in a tighter transaction.
 - **No retries on `LinkedInBlocked`:** if `detection.inspect_page` flags a page, the operation halts and the user must manually verify the account is unrestricted before re-running. Do not add automatic re-tries or workarounds.
+
+## Email followups (3-email sequence)
+
+`send_email_drafts` handles initial sends **and** scheduled followups together. The sequence is driven entirely by data on `OutreachEvent`:
+
+- `sequence_number`: 1 = initial, 2/3/... = followups
+- `due_at`: when a `SCHEDULED` followup becomes eligible to send. `None` = send immediately (initial drafts).
+- `parent_event_id`: each followup links back to the initial event in the same chain. Used to (a) find the chain's `sent_at` lower-bound for IMAP reply search, (b) cascade `SKIPPED_REPLIED` across siblings, (c) copy the parent's `message_id` into `In-Reply-To` / `References` headers so Gmail threads the conversation.
+- `message_id`: set by us at send time via `make_msgid()`. Persisted so followups can reference it.
+
+**Followup status flow:**
+```
+DRAFTED (seq=1) ─send─→ SENT ──→ _schedule_followups() creates SCHEDULED rows (seq=2,3)
+                                                              │
+                              ─due_at passes, send command picks it up─→
+                                                              │
+                          reply-check → SENT  or  SKIPPED_REPLIED (cascades to siblings)
+```
+
+**Reply detection** (`mailer/reply_detector.py`) uses IMAP, not Gmail API. Uses the same App Password as SMTP. Returns `ReplyCheckError` on any failure — callers honor `followups.reply_detection.on_error` (`skip` = safer, `send` = optimistic). Never silently treat IMAP failure as "no reply".
+
+**Re: subject normalization** is in `_normalize_subject_for_reply` — strips any number of leading `Re:` prefixes (case-insensitive) and adds exactly one. Use it whenever generating a followup subject.
+
+**Subagents adding more followup steps** can simply add entries to `config.yaml#followups.email_sequence` — `_schedule_followups()` iterates the list and assigns `sequence_number` starting from 2. No code change required for an additional step beyond a new template file.
+
+## Schema changes
+
+There is no Alembic. `db/migrate.py` holds a `_COLUMN_ADDITIONS` list of `(table, column, ddl)` triples and applies any missing columns via `ALTER TABLE` on each `agent init` run. **When you add a column to an existing model, append the corresponding tuple to that list** — `create_all` alone won't add it to pre-existing databases.

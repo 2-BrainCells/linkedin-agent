@@ -84,6 +84,32 @@ class FilterSettings(BaseModel):
     min_score: int = 6
 
 
+class FollowupStep(BaseModel):
+    delay_hours: float
+    template: Path
+
+
+class ReplyDetectionSettings(BaseModel):
+    enabled: bool = True
+    imap_host: str = "imap.gmail.com"
+    imap_port: int = 993
+    mailbox: str = "INBOX"
+    on_error: str = "skip"  # "skip" (default) or "send"
+
+    @field_validator("on_error")
+    @classmethod
+    def _validate_on_error(cls, v: str) -> str:
+        if v not in {"skip", "send"}:
+            raise ValueError("reply_detection.on_error must be 'skip' or 'send'")
+        return v
+
+
+class FollowupsSettings(BaseModel):
+    enabled: bool = True
+    email_sequence: list[FollowupStep] = Field(default_factory=list)
+    reply_detection: ReplyDetectionSettings = Field(default_factory=ReplyDetectionSettings)
+
+
 class PathsSettings(BaseModel):
     database: Path
     audit_log: Path
@@ -114,11 +140,12 @@ class Settings(BaseModel):
     templates: TemplatesSettings
     filter: FilterSettings
     paths: PathsSettings
+    followups: FollowupsSettings = Field(default_factory=FollowupsSettings)
 
     secrets: _Secrets = Field(default_factory=_Secrets)
 
     @field_validator("ollama", "caps", "delays", "search", "linkedin", "email",
-                     "templates", "filter", "paths", mode="before")
+                     "templates", "filter", "paths", "followups", mode="before")
     @classmethod
     def _coerce_dict(cls, v):  # noqa: ANN001
         return v or {}
@@ -170,6 +197,9 @@ __all__ = [
     "TemplatesSettings",
     "FilterSettings",
     "PathsSettings",
+    "FollowupStep",
+    "FollowupsSettings",
+    "ReplyDetectionSettings",
     "PROJECT_ROOT",
     "load_settings",
 ]
