@@ -1,0 +1,62 @@
+ollama:
+  host: http://localhost:11434
+  filter_model: qwen2.5:3b
+  personalize_model: llama3.1:8b
+  parse_model: qwen2.5:3b
+  request_timeout_seconds: 120
+
+caps:
+  profile_visits_per_day: 25
+  linkedin_messages_per_day: 15
+  emails_per_day: 40
+
+delays:
+  between_profile_visits:
+    mean_seconds: 8
+    stdev_seconds: 3
+    min_seconds: 3
+  between_messages:
+    mean_seconds: 45
+    stdev_seconds: 15
+    min_seconds: 20
+  working_hours:
+    start: "09:00"
+    end: "18:00"
+    tz: "Asia/Kolkata"
+    enforce: true
+
+search:
+  prefer_sales_navigator: true
+  max_results_per_query: 100
+
+linkedin:
+  browser_profile_dir: ./data/chrome_profile
+  headed: true
+  slow_mo_ms: 50
+
+email:
+  from_address: theaiabhinav@gmail.com
+  from_name: Abhinav
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  signature_file: ./templates/signature.txt
+  reply_to: ""
+
+templates:
+  linkedin_message: ./templates/linkedin_message.md
+  email_subject: ./templates/email_subject.txt
+  email_body: ./templates/email_outreach.md
+
+filter:
+  # Free-form criteria the LLM uses to score each prospect's headline.
+  # Edit per campaign or override with `agent filter --criteria-file path.md`.
+  criteria: |
+    Keep prospects who appear to be founders, CTOs, heads of engineering,
+    or senior ML/AI engineers at startups (Seed–Series B). Drop recruiters,
+    students, sales/marketing, and anyone whose headline is unclear.
+  min_score: 6
+
+paths:
+  database: ./data/agent.db
+  audit_log: ./data/logs/audit.log
+  app_log: ./data/logs/app.log
